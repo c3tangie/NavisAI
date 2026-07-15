@@ -1,5 +1,12 @@
 {
+    "python.defaultInterpreterPath": "C:\\Users\\jonal\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
     "code-runner.executorMap": {
-        "python": "python3 -u"
-    }
+        "python": "C:\\Users\\jonal\\AppData\\Local\\Programs\\Python\\Python312\\python.exe -u"
+    },
+    "code-runner.runInTerminal": true,
+    "code-runner.fileDirectoryAsCwd": true,
+    "code-runner.saveFileBeforeRun": true,
+    "code-runner.ignoreSelection": true,
+    "code-runner.respectShebang": false,
+    "python-envs.defaultEnvManager": "ms-python.python:system"
 }
