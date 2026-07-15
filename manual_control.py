@@ -40,7 +40,7 @@ Use ARROWS or WASD keys for control.
     V            : Select next map layer (Shift+V reverse)
     B            : Load current selected map layer (Shift+B to unload)
 
-    R            : toggle recording images to disk
+    R            : toggle on/off steering dataset recording 
 
     CTRL + R     : toggle recording of simulation (replacing any previous)
     CTRL + P     : start replaying last recorded simulation
@@ -70,10 +70,12 @@ import datetime
 import logging
 import math
 import os
+import queue
 import random
 import re
 import subprocess
 import sys
+import threading
 import time
 import weakref
 
@@ -324,6 +326,8 @@ class World(object):
             pass
 
     def tick(self, clock):
+        self.camera_manager.process_recording_queue()
+        self.camera_manager.report_recording_error()
         self.hud.tick(self, clock)
 
     def render(self, display):
@@ -331,6 +335,7 @@ class World(object):
         self.hud.render(display)
 
     def destroy_sensors(self):
+        self.camera_manager.stop_recording(notify=False)
         self.camera_manager.sensor.destroy()
         self.camera_manager.sensor = None
         self.camera_manager.index = None
@@ -338,6 +343,7 @@ class World(object):
     def destroy(self):
         if self.radar_sensor is not None:
             self.toggle_radar()
+        self.camera_manager.stop_recording(notify=False)
         sensors = [
             self.camera_manager.sensor,
             self.collision_sensor.sensor,
@@ -1076,12 +1082,21 @@ class RadarSensor(object):
 
 
 class CameraManager(object):
+    RECORDING_INTERVAL = 0.05
+    RECORDING_SIZE = (220, 220)
+
     def __init__(self, parent_actor, hud, gamma_correction):
         self.sensor = None
         self.surface = None
         self._parent = parent_actor
         self.hud = hud
         self.recording = False
+        self._recording_lock = threading.Lock()
+        self._recording_queue = None
+        self._recording_error = None
+        self._steer_values_file = None
+        self._next_image_number = None
+        self._last_recorded_timestamp = None
         bound_x = 0.5 + self._parent.bounding_box.extent.x
         bound_y = 0.5 + self._parent.bounding_box.extent.y
         bound_z = 0.5 + self._parent.bounding_box.extent.z
@@ -1174,8 +1189,125 @@ class CameraManager(object):
         self.set_sensor(self.index + 1)
 
     def toggle_recording(self):
-        self.recording = not self.recording
-        self.hud.notification('Recording %s' % ('On' if self.recording else 'Off'))
+        if self.recording:
+            self.stop_recording()
+        else:
+            self.start_recording()
+
+    def start_recording(self):
+        with self._recording_lock:
+            output_dir = 'output'
+            steer_values_path = os.path.join(output_dir, 'steer_values.txt')
+            os.makedirs(output_dir, exist_ok=True)
+
+            image_paths = sorted(
+                os.path.join(output_dir, name)
+                for name in os.listdir(output_dir)
+                if name.lower().endswith('.png'))
+            existing_value_count = 0
+            if os.path.exists(steer_values_path):
+                with open(steer_values_path, 'r', encoding='utf-8') as values_file:
+                    existing_value_count = sum(
+                        1 for line in values_file if line.strip())
+
+            if len(image_paths) != existing_value_count:
+                self.hud.notification(
+                    'Recording error: image/steering counts do not match')
+                return
+
+            image_numbers = []
+            for image_path in image_paths:
+                stem = os.path.splitext(os.path.basename(image_path))[0]
+                if not stem.isdigit():
+                    self.hud.notification(
+                        'Recording error: output PNG names must be numeric')
+                    return
+                image_numbers.append(int(stem))
+
+            self._steer_values_file = open(
+                steer_values_path, 'a', encoding='utf-8', buffering=1)
+            self._next_image_number = max(image_numbers, default=-1) + 1
+            self._last_recorded_timestamp = None
+            self._recording_error = None
+            self._recording_queue = queue.Queue()
+            self.recording = True
+            self.hud.notification('Dataset recording On')
+
+    def stop_recording(self, notify=True):
+        with self._recording_lock:
+            was_recording = self.recording
+            self.recording = False
+        self.process_recording_queue()
+        if self._steer_values_file is not None:
+            self._steer_values_file.close()
+            self._steer_values_file = None
+        self._recording_queue = None
+        if notify and was_recording:
+            self.hud.notification('Dataset recording Off')
+
+    def _queue_record_sample(self, image, rgb_array):
+        with self._recording_lock:
+            if not self.recording:
+                return
+            if not self.sensors[self.index][0].startswith('sensor.camera.rgb'):
+                return
+            if (self._last_recorded_timestamp is not None and
+                    image.timestamp - self._last_recorded_timestamp <
+                    self.RECORDING_INTERVAL - 1e-6):
+                return
+
+            try:
+                steer_value = self._parent.get_control().steer
+                self._recording_queue.put((rgb_array.copy(), steer_value))
+                self._last_recorded_timestamp = image.timestamp
+            except Exception as error:
+                self.recording = False
+                self._recording_error = str(error)
+
+    def process_recording_queue(self):
+        recording_queue = self._recording_queue
+        if recording_queue is None:
+            return
+
+        while True:
+            try:
+                rgb_array, steer_value = recording_queue.get_nowait()
+            except queue.Empty:
+                return
+
+            image_path = os.path.join(
+                'output', '%06d.png' % self._next_image_number)
+            try:
+                recording_surface = pygame.surfarray.make_surface(
+                    rgb_array.swapaxes(0, 1))
+                recording_surface = pygame.transform.smoothscale(
+                    recording_surface, self.RECORDING_SIZE)
+                pygame.image.save(recording_surface, image_path)
+                self._steer_values_file.write('%s\n' % steer_value)
+                self._steer_values_file.flush()
+            except BaseException as error:
+                if os.path.exists(image_path):
+                    os.remove(image_path)
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                with self._recording_lock:
+                    self.recording = False
+                    self._recording_error = str(error)
+                    self._recording_queue = None
+                return
+
+            self._next_image_number += 1
+
+    def report_recording_error(self):
+        with self._recording_lock:
+            error = self._recording_error
+            self._recording_error = None
+        if error is not None:
+            if self._steer_values_file is not None:
+                self._steer_values_file.close()
+                self._steer_values_file = None
+            self._recording_queue = None
+            self.hud.notification('Dataset recording error: %s' % error)
 
     def render(self, display):
         if self.surface is not None:
@@ -1223,7 +1355,7 @@ class CameraManager(object):
             array = array[:, :, ::-1]
             self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
         if self.recording:
-            image.save_to_disk('_out/%08d' % image.frame)
+            self._queue_record_sample(image, array)
 
 
 # ==============================================================================
