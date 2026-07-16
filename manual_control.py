@@ -41,6 +41,7 @@ Use ARROWS or WASD keys for control.
     B            : Load current selected map layer (Shift+B to unload)
 
     R            : toggle on/off steering dataset recording 
+    J            : toggle NavisSteer model steering (when a checkpoint is loaded)
 
     CTRL + R     : toggle recording of simulation (replacing any previous)
     CTRL + P     : start replaying last recorded simulation
@@ -107,6 +108,7 @@ try:
     from pygame.locals import K_g
     from pygame.locals import K_h
     from pygame.locals import K_i
+    from pygame.locals import K_j
     from pygame.locals import K_l
     from pygame.locals import K_m
     from pygame.locals import K_n
@@ -383,6 +385,7 @@ class KeyboardControl(object):
         else:
             raise NotImplementedError("Actor type not supported")
         self._steer_cache = 0.0
+        self.navissteer_enabled = False
         world.hud.notification("Press 'H' or '?' for help.", seconds=4.0)
 
     def parse_events(self, client, world, clock, sync_mode):
@@ -562,6 +565,16 @@ class KeyboardControl(object):
                             current_lights ^= carla.VehicleLightState.Fog
                     elif event.key == K_i:
                         current_lights ^= carla.VehicleLightState.Interior
+                    elif event.key == K_j:
+                        if getattr(world, 'navissteer_available', False):
+                            self.navissteer_enabled = not self.navissteer_enabled
+                            state = ('enabled' if self.navissteer_enabled
+                                     else 'disabled')
+                            world.hud.notification(
+                                'NavisSteer steering %s' % state)
+                        else:
+                            world.hud.notification(
+                                'No NavisSteer checkpoint loaded')
                     elif event.key == K_z:
                         current_lights ^= carla.VehicleLightState.LeftBlinker
                     elif event.key == K_x:
@@ -1088,6 +1101,7 @@ class CameraManager(object):
     def __init__(self, parent_actor, hud, gamma_correction):
         self.sensor = None
         self.surface = None
+        self.latest_rgb_array = None
         self._parent = parent_actor
         self.hud = hud
         self.recording = False
@@ -1177,6 +1191,7 @@ class CameraManager(object):
                 self._camera_transforms[self.transform_index][0],
                 attach_to=self._parent,
                 attachment_type=self._camera_transforms[self.transform_index][1])
+            self.latest_rgb_array = None
             # We need to pass the lambda a weak reference to self to avoid
             # circular reference.
             weak_self = weakref.ref(self)
@@ -1354,8 +1369,60 @@ class CameraManager(object):
             array = array[:, :, :3]
             array = array[:, :, ::-1]
             self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
+        if self.sensors[self.index][0].startswith('sensor.camera.rgb'):
+            self.latest_rgb_array = np.ascontiguousarray(array)
+        else:
+            self.latest_rgb_array = None
         if self.recording:
             self._queue_record_sample(image, array)
+
+
+class NavisSteerCamera(object):
+    """Dedicated forward RGB camera used only for model inference."""
+
+    def __init__(self, parent_actor, width, height, gamma_correction):
+        self.parent_id = parent_actor.id
+        self.latest_rgb_array = None
+
+        world = parent_actor.get_world()
+        blueprint = world.get_blueprint_library().find('sensor.camera.rgb')
+        blueprint.set_attribute('image_size_x', str(width))
+        blueprint.set_attribute('image_size_y', str(height))
+        blueprint.set_attribute('sensor_tick', '0.05')
+        if blueprint.has_attribute('gamma'):
+            blueprint.set_attribute('gamma', str(gamma_correction))
+
+        bound_x = 0.5 + parent_actor.bounding_box.extent.x
+        bound_z = 0.5 + parent_actor.bounding_box.extent.z
+        transform = carla.Transform(
+            carla.Location(x=0.8 * bound_x, y=0.0, z=1.3 * bound_z)
+        )
+        self.sensor = world.spawn_actor(
+            blueprint,
+            transform,
+            attach_to=parent_actor,
+            attachment_type=carla.AttachmentType.Rigid,
+        )
+        weak_self = weakref.ref(self)
+        self.sensor.listen(
+            lambda image: NavisSteerCamera._parse_image(weak_self, image)
+        )
+
+    @staticmethod
+    def _parse_image(weak_self, image):
+        self = weak_self()
+        if self is None:
+            return
+        bgra = np.frombuffer(image.raw_data, dtype=np.uint8)
+        bgra = bgra.reshape((image.height, image.width, 4))
+        self.latest_rgb_array = np.ascontiguousarray(bgra[:, :, :3][:, :, ::-1])
+
+    def destroy(self):
+        if self.sensor is not None:
+            if self.sensor.is_alive:
+                self.sensor.stop()
+                self.sensor.destroy()
+            self.sensor = None
 
 
 # ==============================================================================
@@ -1458,11 +1525,32 @@ def game_loop(args):
     world = None
     original_settings = None
     server_process = None
+    navissteer_runtime = None
+    navissteer_camera = None
+    smoothed_steering = 0.0
 
     try:
         client, server_process = connect_or_start_server(args)
 
         sim_world = client.get_world()
+        if args.map:
+            current_map = sim_world.get_map().name.rsplit('/', 1)[-1]
+            if current_map != args.map:
+                print('Loading CARLA map %s...' % args.map)
+                client.set_timeout(120.0)
+                sim_world = client.load_world(args.map)
+                client.set_timeout(2000.0)
+            print('Current CARLA map: %s' %
+                  sim_world.get_map().name.rsplit('/', 1)[-1])
+
+        if args.weather:
+            if not hasattr(carla.WeatherParameters, args.weather):
+                raise ValueError(
+                    'Unknown CARLA weather preset: %s' % args.weather)
+            sim_world.set_weather(
+                getattr(carla.WeatherParameters, args.weather))
+            print('Weather preset: %s' % args.weather)
+
         if args.sync:
             original_settings = sim_world.get_settings()
             settings = sim_world.get_settings()
@@ -1488,6 +1576,37 @@ def game_loop(args):
         world = World(sim_world, hud, args)
         controller = KeyboardControl(world, args.autopilot)
 
+        if args.navissteer_model:
+            if args.autopilot:
+                raise ValueError(
+                    '--autopilot and --navissteer-model cannot be used together.')
+            try:
+                from navissteer_model import NavisSteerRuntime
+                navissteer_runtime = NavisSteerRuntime(args.navissteer_model)
+            except Exception as error:
+                raise RuntimeError(
+                    'Could not load the NavisSteer checkpoint: %s' % error) from error
+            hud.notification(
+                'NavisSteer loaded (%s); model controls steering' %
+                navissteer_runtime.device,
+                seconds=6.0)
+            world.navissteer_available = True
+            controller.navissteer_enabled = True
+            navissteer_camera = NavisSteerCamera(
+                world.player,
+                args.width,
+                args.height,
+                args.gamma,
+            )
+            print(
+                'NavisSteer loaded on %s. Steering is model-controlled.' %
+                navissteer_runtime.device)
+            print('Press J to switch between NavisSteer and manual steering.')
+            if args.model_throttle is None:
+                print('Throttle and brake remain under keyboard control.')
+            else:
+                print('Automatic throttle: %.2f' % args.model_throttle)
+
         if args.sync:
             sim_world.tick()
         else:
@@ -1500,6 +1619,37 @@ def game_loop(args):
             clock.tick_busy_loop(60)
             if controller.parse_events(client, world, clock, args.sync):
                 return
+            if (navissteer_runtime is not None and
+                    controller.navissteer_enabled and
+                    isinstance(world.player, carla.Vehicle)):
+                if (navissteer_camera is None or
+                        navissteer_camera.parent_id != world.player.id):
+                    if navissteer_camera is not None:
+                        navissteer_camera.destroy()
+                    navissteer_camera = NavisSteerCamera(
+                        world.player,
+                        args.width,
+                        args.height,
+                        args.gamma,
+                    )
+                    smoothed_steering = 0.0
+                rgb_array = navissteer_camera.latest_rgb_array
+                if rgb_array is not None:
+                    predicted_steering = navissteer_runtime.predict(rgb_array)
+                    alpha = args.steering_smoothing
+                    smoothed_steering = (
+                        alpha * predicted_steering
+                        + (1.0 - alpha) * smoothed_steering
+                    )
+                    model_control = world.player.get_control()
+                    model_control.steer = smoothed_steering
+                    if args.model_throttle is not None:
+                        # Keyboard S/Down and Space always override fixed throttle.
+                        if model_control.brake > 0.0 or model_control.hand_brake:
+                            model_control.throttle = 0.0
+                        else:
+                            model_control.throttle = args.model_throttle
+                    world.player.apply_control(model_control)
             display = pygame.display.get_surface()
             world.tick(clock)
             world.render(display)
@@ -1512,6 +1662,9 @@ def game_loop(args):
 
         if (world and world.recording_enabled):
             client.stop_recorder()
+
+        if navissteer_camera is not None:
+            navissteer_camera.destroy()
 
         if world is not None:
             world.destroy()
@@ -1567,6 +1720,16 @@ def main():
         default='2',
         help='restrict to certain actor generation (values: "1","2","All" - default: "2")')
     argparser.add_argument(
+        '--map',
+        metavar='TOWN',
+        default=None,
+        help='load a CARLA map such as Town02 before spawning the vehicle')
+    argparser.add_argument(
+        '--weather',
+        metavar='PRESET',
+        default=None,
+        help='CARLA weather preset such as ClearNoon')
+    argparser.add_argument(
         '--rolename',
         metavar='NAME',
         default='hero',
@@ -1584,7 +1747,40 @@ def main():
         '--show-server-window',
         action='store_true',
         help='show the automatically started CARLA server window')
+    argparser.add_argument(
+        '--navissteer-model',
+        metavar='CHECKPOINT',
+        default=None,
+        help='use a NavisSteer checkpoint to control steering')
+    argparser.add_argument(
+        '--model-throttle',
+        metavar='VALUE',
+        default=None,
+        type=float,
+        help='optional fixed throttle for NavisSteer (start at 0.20)')
+    argparser.add_argument(
+        '--steering-smoothing',
+        metavar='ALPHA',
+        default=0.35,
+        type=float,
+        help='new-prediction weight from 0 to 1 (default: 0.35)')
     args = argparser.parse_args()
+
+    # Use the cleanest known dataset-like setup unless explicitly overridden.
+    if args.navissteer_model:
+        if args.map is None:
+            args.map = 'Town02'
+        if args.weather is None:
+            args.weather = 'ClearNoon'
+        if args.filter == 'vehicle.*':
+            args.filter = 'vehicle.tesla.model3'
+
+    if args.model_throttle is not None and not 0.0 <= args.model_throttle <= 1.0:
+        argparser.error('--model-throttle must be between 0.0 and 1.0')
+    if args.model_throttle is not None and not args.navissteer_model:
+        argparser.error('--model-throttle requires --navissteer-model')
+    if not 0.0 < args.steering_smoothing <= 1.0:
+        argparser.error('--steering-smoothing must be greater than 0 and at most 1')
 
     args.width, args.height = [int(x) for x in args.res.split('x')]
 

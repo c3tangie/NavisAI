@@ -1,0 +1,36 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "CARLA Manual Control",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/manual_control.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Verify NavisSteer Checkpoint",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/verify_checkpoint.py",
+            "args": ["models/navissteer_best.pt"],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "CARLA with NavisSteer (manual throttle)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/manual_control.py",
+            "args": [
+                "--navissteer-model", "models/navissteer_best.pt",
+                "--map", "Town02",
+                "--weather", "ClearNoon",
+                "--filter", "vehicle.tesla.model3"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
