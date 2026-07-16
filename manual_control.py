@@ -41,7 +41,7 @@ Use ARROWS or WASD keys for control.
     B            : Load current selected map layer (Shift+B to unload)
 
     R            : toggle on/off steering dataset recording 
-    J            : toggle NavisSteer model steering (when a checkpoint is loaded)
+    J            : toggle loaded model steering (NavisSteer or LinearSteer)
 
     CTRL + R     : toggle recording of simulation (replacing any previous)
     CTRL + P     : start replaying last recorded simulation
@@ -385,7 +385,7 @@ class KeyboardControl(object):
         else:
             raise NotImplementedError("Actor type not supported")
         self._steer_cache = 0.0
-        self.navissteer_enabled = False
+        self.model_steering_enabled = False
         world.hud.notification("Press 'H' or '?' for help.", seconds=4.0)
 
     def parse_events(self, client, world, clock, sync_mode):
@@ -566,15 +566,15 @@ class KeyboardControl(object):
                     elif event.key == K_i:
                         current_lights ^= carla.VehicleLightState.Interior
                     elif event.key == K_j:
-                        if getattr(world, 'navissteer_available', False):
-                            self.navissteer_enabled = not self.navissteer_enabled
-                            state = ('enabled' if self.navissteer_enabled
+                        if getattr(world, 'model_steering_available', False):
+                            self.model_steering_enabled = not self.model_steering_enabled
+                            state = ('enabled' if self.model_steering_enabled
                                      else 'disabled')
                             world.hud.notification(
-                                'NavisSteer steering %s' % state)
+                                'Model steering %s' % state)
                         else:
                             world.hud.notification(
-                                'No NavisSteer checkpoint loaded')
+                                'No steering-model checkpoint loaded')
                     elif event.key == K_z:
                         current_lights ^= carla.VehicleLightState.LeftBlinker
                     elif event.key == K_x:
@@ -1525,8 +1525,8 @@ def game_loop(args):
     world = None
     original_settings = None
     server_process = None
-    navissteer_runtime = None
-    navissteer_camera = None
+    steering_runtime = None
+    steering_camera = None
     smoothed_steering = 0.0
 
     try:
@@ -1576,32 +1576,43 @@ def game_loop(args):
         world = World(sim_world, hud, args)
         controller = KeyboardControl(world, args.autopilot)
 
-        if args.navissteer_model:
+        steering_checkpoint = (
+            args.navissteer_model or args.linearsteer_model
+        )
+        steering_model_name = (
+            'NavisSteer' if args.navissteer_model else 'LinearSteer'
+        )
+        if steering_checkpoint:
             if args.autopilot:
                 raise ValueError(
-                    '--autopilot and --navissteer-model cannot be used together.')
+                    '--autopilot and model steering cannot be used together.')
             try:
-                from navissteer_model import NavisSteerRuntime
-                navissteer_runtime = NavisSteerRuntime(args.navissteer_model)
+                if args.navissteer_model:
+                    from navissteer_model import NavisSteerRuntime
+                    steering_runtime = NavisSteerRuntime(steering_checkpoint)
+                else:
+                    from navissteer_model import LinearSteerRuntime
+                    steering_runtime = LinearSteerRuntime(steering_checkpoint)
             except Exception as error:
                 raise RuntimeError(
-                    'Could not load the NavisSteer checkpoint: %s' % error) from error
+                    'Could not load the %s checkpoint: %s' %
+                    (steering_model_name, error)) from error
             hud.notification(
-                'NavisSteer loaded (%s); model controls steering' %
-                navissteer_runtime.device,
+                '%s loaded (%s); model controls steering' %
+                (steering_model_name, steering_runtime.device),
                 seconds=6.0)
-            world.navissteer_available = True
-            controller.navissteer_enabled = True
-            navissteer_camera = NavisSteerCamera(
+            world.model_steering_available = True
+            controller.model_steering_enabled = True
+            steering_camera = NavisSteerCamera(
                 world.player,
                 args.width,
                 args.height,
                 args.gamma,
             )
             print(
-                'NavisSteer loaded on %s. Steering is model-controlled.' %
-                navissteer_runtime.device)
-            print('Press J to switch between NavisSteer and manual steering.')
+                '%s loaded on %s. Steering is model-controlled.' %
+                (steering_model_name, steering_runtime.device))
+            print('Press J to switch between model and manual steering.')
             if args.model_throttle is None:
                 print('Throttle and brake remain under keyboard control.')
             else:
@@ -1619,23 +1630,23 @@ def game_loop(args):
             clock.tick_busy_loop(60)
             if controller.parse_events(client, world, clock, args.sync):
                 return
-            if (navissteer_runtime is not None and
-                    controller.navissteer_enabled and
+            if (steering_runtime is not None and
+                    controller.model_steering_enabled and
                     isinstance(world.player, carla.Vehicle)):
-                if (navissteer_camera is None or
-                        navissteer_camera.parent_id != world.player.id):
-                    if navissteer_camera is not None:
-                        navissteer_camera.destroy()
-                    navissteer_camera = NavisSteerCamera(
+                if (steering_camera is None or
+                        steering_camera.parent_id != world.player.id):
+                    if steering_camera is not None:
+                        steering_camera.destroy()
+                    steering_camera = NavisSteerCamera(
                         world.player,
                         args.width,
                         args.height,
                         args.gamma,
                     )
                     smoothed_steering = 0.0
-                rgb_array = navissteer_camera.latest_rgb_array
+                rgb_array = steering_camera.latest_rgb_array
                 if rgb_array is not None:
-                    predicted_steering = navissteer_runtime.predict(rgb_array)
+                    predicted_steering = steering_runtime.predict(rgb_array)
                     alpha = args.steering_smoothing
                     smoothed_steering = (
                         alpha * predicted_steering
@@ -1663,8 +1674,8 @@ def game_loop(args):
         if (world and world.recording_enabled):
             client.stop_recorder()
 
-        if navissteer_camera is not None:
-            navissteer_camera.destroy()
+        if steering_camera is not None:
+            steering_camera.destroy()
 
         if world is not None:
             world.destroy()
@@ -1723,7 +1734,7 @@ def main():
         '--map',
         metavar='TOWN',
         default=None,
-        help='load a CARLA map such as Town02 before spawning the vehicle')
+        help='load a CARLA map such as Town04 before spawning the vehicle')
     argparser.add_argument(
         '--weather',
         metavar='PRESET',
@@ -1747,17 +1758,23 @@ def main():
         '--show-server-window',
         action='store_true',
         help='show the automatically started CARLA server window')
-    argparser.add_argument(
+    steering_model_group = argparser.add_mutually_exclusive_group()
+    steering_model_group.add_argument(
         '--navissteer-model',
         metavar='CHECKPOINT',
         default=None,
         help='use a NavisSteer checkpoint to control steering')
+    steering_model_group.add_argument(
+        '--linearsteer-model',
+        metavar='CHECKPOINT',
+        default=None,
+        help='use a LinearSteer baseline checkpoint to control steering')
     argparser.add_argument(
         '--model-throttle',
         metavar='VALUE',
         default=None,
         type=float,
-        help='optional fixed throttle for NavisSteer (start at 0.20)')
+        help='optional fixed throttle for model steering (start at 0.20)')
     argparser.add_argument(
         '--steering-smoothing',
         metavar='ALPHA',
@@ -1767,9 +1784,9 @@ def main():
     args = argparser.parse_args()
 
     # Use the cleanest known dataset-like setup unless explicitly overridden.
-    if args.navissteer_model:
+    if args.navissteer_model or args.linearsteer_model:
         if args.map is None:
-            args.map = 'Town02'
+            args.map = 'Town04'
         if args.weather is None:
             args.weather = 'ClearNoon'
         if args.filter == 'vehicle.*':
@@ -1777,8 +1794,11 @@ def main():
 
     if args.model_throttle is not None and not 0.0 <= args.model_throttle <= 1.0:
         argparser.error('--model-throttle must be between 0.0 and 1.0')
-    if args.model_throttle is not None and not args.navissteer_model:
-        argparser.error('--model-throttle requires --navissteer-model')
+    if (args.model_throttle is not None and
+            not (args.navissteer_model or args.linearsteer_model)):
+        argparser.error(
+            '--model-throttle requires --navissteer-model or '
+            '--linearsteer-model')
     if not 0.0 < args.steering_smoothing <= 1.0:
         argparser.error('--steering-smoothing must be greater than 0 and at most 1')
 

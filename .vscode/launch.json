@@ -19,13 +19,36 @@
             "cwd": "${workspaceFolder}"
         },
         {
+            "name": "Verify LinearSteer Checkpoint",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/verify_checkpoint.py",
+            "args": ["models/linearsteer_best.pt"],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
             "name": "CARLA with NavisSteer (manual throttle)",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/manual_control.py",
             "args": [
                 "--navissteer-model", "models/navissteer_best.pt",
-                "--map", "Town02",
+                "--map", "Town04",
+                "--weather", "ClearNoon",
+                "--filter", "vehicle.tesla.model3"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "CARLA with LinearSteer (manual throttle)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/manual_control.py",
+            "args": [
+                "--linearsteer-model", "models/linearsteer_best.pt",
+                "--map", "Town04",
                 "--weather", "ClearNoon",
                 "--filter", "vehicle.tesla.model3"
             ],
