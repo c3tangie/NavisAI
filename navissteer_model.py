@@ -14,10 +14,16 @@ import torch.nn.functional as F
 class NavisSteer(nn.Module):
     """CNN regression model that predicts one CARLA steering value."""
 
-    def __init__(self):
+    def __init__(self, input_channels=1):
         super().__init__()
 
-        self.conv1 = nn.Conv2d(1, 32, 3, padding=1)
+        self.input_channels = int(input_channels)
+        if self.input_channels not in (1, 3):
+            raise ValueError(
+                f"NavisSteer supports 1 or 3 input channels, got {input_channels}."
+            )
+
+        self.conv1 = nn.Conv2d(self.input_channels, 32, 3, padding=1)
         self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
         self.conv3 = nn.Conv2d(64, 128, 3, padding=1)
 
@@ -76,8 +82,13 @@ def load_navissteer_checkpoint(checkpoint_path, device=None):
             f"Expected a NavisSteer checkpoint, got {checkpoint.get('model_name')!r}."
         )
 
-    model = NavisSteer().to(device)
-    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    state_dict = checkpoint["model_state_dict"]
+    input_channels = int(
+        checkpoint.get("input_channels", state_dict["conv1.weight"].shape[1])
+    )
+
+    model = NavisSteer(input_channels=input_channels).to(device)
+    model.load_state_dict(state_dict, strict=True)
     model.eval()
     return model, checkpoint, device
 
@@ -95,9 +106,15 @@ class NavisSteerRuntime:
             raise ValueError(
                 f"This runtime expects a 220x220 checkpoint, got {self.image_size}."
             )
+        self.input_channels = int(
+            self.metadata.get(
+                "input_channels",
+                self.model.conv1.weight.shape[1],
+            )
+        )
 
     def preprocess_rgb(self, rgb_array):
-        """Convert an HxWx3 uint8 RGB array to [1, 1, 220, 220]."""
+        """Convert an HxWx3 uint8 RGB array to checkpoint-compatible input."""
 
         rgb_array = np.asarray(rgb_array)
         if rgb_array.ndim != 3 or rgb_array.shape[2] != 3:
@@ -107,9 +124,11 @@ class NavisSteerRuntime:
         image = torch.from_numpy(rgb_array).to(self.device, non_blocking=True)
         image = image.permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
 
-        # Match the notebook's grayscale conversion before resizing.
-        red, green, blue = image[:, 0:1], image[:, 1:2], image[:, 2:3]
-        image = 0.299 * red + 0.587 * green + 0.114 * blue
+        if self.input_channels == 1:
+            # Match the old notebook's grayscale conversion before resizing.
+            red, green, blue = image[:, 0:1], image[:, 1:2], image[:, 2:3]
+            image = 0.299 * red + 0.587 * green + 0.114 * blue
+
         image = F.interpolate(
             image,
             size=self.image_size,
