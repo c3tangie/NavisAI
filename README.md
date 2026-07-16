@@ -52,19 +52,3 @@ For a later low-speed autonomous test, add `--model-throttle 0.20`. Start with
 manual throttle first so that you can release `W` immediately if steering is
 unsafe. When fixed throttle is enabled, `S`/Down and Space still override it
 for braking.
-
-## CARLA map previews
-
-To visually compare the installed CARLA maps, generate a local screenshot
-gallery:
-
-```powershell
-python preview_carla_maps.py
-```
-
-The script saves road-level screenshots and an HTML gallery to
-`map_previews/index.html`. To only preview a few candidates, run:
-
-```powershell
-python preview_carla_maps.py --maps Town01 Town02 Town04 Town05
-```
