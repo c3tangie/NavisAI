@@ -20,7 +20,9 @@ Use ARROWS or WASD keys for control.
     P            : toggle autopilot
     M            : toggle manual transmission
     ,/.          : gear up/down
-    CTRL + W     : toggle constant velocity mode at 60 km/h
+    CTRL + W     : toggle constant velocity mode
+    CTRL + UP    : increase constant velocity by 10 km/h
+    CTRL + DOWN  : decrease constant velocity by 10 km/h
 
     L            : toggle next light type
     SHIFT + L    : toggle high beam
@@ -204,11 +206,12 @@ class World(object):
         self._actor_filter = args.filter
         self._actor_generation = args.generation
         self._gamma = args.gamma
+        self.constant_velocity_enabled = False
+        self.constant_velocity_speed_kmh = 60
         self.restart()
         self.world.on_tick(hud.on_world_tick)
         self.recording_enabled = False
         self.recording_start = 0
-        self.constant_velocity_enabled = False
         self.show_vehicle_telemetry = False
         self.doors_are_open = False
         self.current_map_layer = 0
@@ -227,6 +230,7 @@ class World(object):
         ]
 
     def restart(self):
+        self.constant_velocity_enabled = False
         self.player_max_speed = 1.589
         self.player_max_speed_fast = 3.713
         # Keep same camera config if the camera manager exists.
@@ -295,6 +299,19 @@ class World(object):
         preset = self._weather_presets[self._weather_index]
         self.hud.notification('Weather: %s' % preset[1])
         self.player.get_world().set_weather(preset[0])
+
+    def apply_constant_velocity(self):
+        speed_metres_per_second = self.constant_velocity_speed_kmh / 3.6
+        self.player.enable_constant_velocity(
+            carla.Vector3D(speed_metres_per_second, 0, 0))
+
+    def adjust_constant_velocity(self, change_kmh):
+        self.constant_velocity_speed_kmh = max(
+            0, self.constant_velocity_speed_kmh + change_kmh)
+        if self.constant_velocity_enabled:
+            self.apply_constant_velocity()
+        self.hud.notification(
+            "Constant velocity: %d km/h" % self.constant_velocity_speed_kmh)
 
     def next_map_layer(self, reverse=False):
         self.current_map_layer += -1 if reverse else 1
@@ -442,9 +459,15 @@ class KeyboardControl(object):
                         world.constant_velocity_enabled = False
                         world.hud.notification("Disabled Constant Velocity Mode")
                     else:
-                        world.player.enable_constant_velocity(carla.Vector3D(17, 0, 0))
+                        world.apply_constant_velocity()
                         world.constant_velocity_enabled = True
-                        world.hud.notification("Enabled Constant Velocity Mode at 60 km/h")
+                        world.hud.notification(
+                            "Enabled Constant Velocity Mode at %d km/h" %
+                            world.constant_velocity_speed_kmh)
+                elif event.key == K_UP and (pygame.key.get_mods() & KMOD_CTRL):
+                    world.adjust_constant_velocity(10)
+                elif event.key == K_DOWN and (pygame.key.get_mods() & KMOD_CTRL):
+                    world.adjust_constant_velocity(-10)
                 elif event.key == K_o:
                     try:
                         if world.doors_are_open:
@@ -1096,7 +1119,7 @@ class RadarSensor(object):
 
 class CameraManager(object):
     RECORDING_INTERVAL = 0.05
-    RECORDING_SIZE = (220, 220)
+    RECORDING_SIZE = (220, 110)
 
     def __init__(self, parent_actor, hud, gamma_correction):
         self.sensor = None
@@ -1211,7 +1234,7 @@ class CameraManager(object):
 
     def start_recording(self):
         with self._recording_lock:
-            output_dir = 'output'
+            output_dir = 'new_data'
             steer_values_path = os.path.join(output_dir, 'steer_values.txt')
             os.makedirs(output_dir, exist_ok=True)
 
@@ -1291,14 +1314,17 @@ class CameraManager(object):
                 return
 
             image_path = os.path.join(
-                'output', '%06d.png' % self._next_image_number)
+                'new_data', '%06d.png' % self._next_image_number)
             try:
+                cropped_array = self._crop_recording_frame(rgb_array)
                 recording_surface = pygame.surfarray.make_surface(
-                    rgb_array.swapaxes(0, 1))
+                    cropped_array.swapaxes(0, 1))
+                # The crop already has a 2:1 aspect ratio, so this scales both
+                # axes uniformly instead of stretching the image.
                 recording_surface = pygame.transform.smoothscale(
                     recording_surface, self.RECORDING_SIZE)
                 pygame.image.save(recording_surface, image_path)
-                self._steer_values_file.write('%s\n' % steer_value)
+                self._steer_values_file.write('%.18e\n' % steer_value)
                 self._steer_values_file.flush()
             except BaseException as error:
                 if os.path.exists(image_path):
@@ -1312,6 +1338,24 @@ class CameraManager(object):
                 return
 
             self._next_image_number += 1
+
+    @staticmethod
+    def _crop_recording_frame(rgb_array):
+        """Remove the upper half and return a centered, undistorted 2:1 crop."""
+        source_height, source_width = rgb_array.shape[:2]
+        lower_half = rgb_array[source_height // 2:, :, :]
+        crop_height, crop_width = lower_half.shape[:2]
+        target_aspect = 2.0
+
+        if crop_width / crop_height > target_aspect:
+            wanted_width = int(round(crop_height * target_aspect))
+            left = (crop_width - wanted_width) // 2
+            lower_half = lower_half[:, left:left + wanted_width, :]
+        elif crop_width / crop_height < target_aspect:
+            wanted_height = int(round(crop_width / target_aspect))
+            lower_half = lower_half[crop_height - wanted_height:, :, :]
+
+        return np.ascontiguousarray(lower_half)
 
     def report_recording_error(self):
         with self._recording_lock:
