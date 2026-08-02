@@ -44,6 +44,8 @@ Use ARROWS or WASD keys for control.
 
     R            : toggle on/off steering dataset recording 
     J            : toggle loaded model steering (NavisSteer or LinearSteer)
+    K            : collect one autopilot lane-recovery sequence
+    NavisVision detections are enabled with --navisvision-model.
 
     CTRL + R     : toggle recording of simulation (replacing any previous)
     CTRL + P     : start replaying last recorded simulation
@@ -82,6 +84,14 @@ import threading
 import time
 import weakref
 
+# Town04's western, outside highway lane.  The closest official map spawn is
+# selected at runtime so this remains stable even if CARLA reorders spawn points.
+TOWN04_HIGHWAY_SPAWN_X = -514.11
+TOWN04_HIGHWAY_SPAWN_Y = 158.82
+TOWN04_HIGHWAY_ROUTE_LENGTH = 4096
+TOWN04_TRAFFIC_MANAGER_SEED = 42
+SYNC_FIXED_DELTA_SECONDS = 0.05
+
 try:
     import pygame
     from pygame.locals import KMOD_CTRL
@@ -111,6 +121,7 @@ try:
     from pygame.locals import K_h
     from pygame.locals import K_i
     from pygame.locals import K_j
+    from pygame.locals import K_k
     from pygame.locals import K_l
     from pygame.locals import K_m
     from pygame.locals import K_n
@@ -229,13 +240,26 @@ class World(object):
             carla.MapLayer.All
         ]
 
+    def uses_town04_highway_route(self):
+        """Return whether the fixed Town04 highway setup applies."""
+        return self.map.name.rsplit('/', 1)[-1] == 'Town04'
+
+    def _town04_highway_spawn(self, spawn_points):
+        """Return the official spawn closest to the chosen highway location."""
+        target = carla.Location(
+            x=TOWN04_HIGHWAY_SPAWN_X,
+            y=TOWN04_HIGHWAY_SPAWN_Y)
+        return min(
+            spawn_points,
+            key=lambda transform: transform.location.distance(target))
+
     def restart(self):
         self.constant_velocity_enabled = False
         self.player_max_speed = 1.589
         self.player_max_speed_fast = 3.713
-        # Keep same camera config if the camera manager exists.
-        cam_index = self.camera_manager.index if self.camera_manager is not None else 0
-        cam_pos_index = self.camera_manager.transform_index if self.camera_manager is not None else 0
+        # Every spawn starts with the standard rigid forward-facing RGB camera.
+        cam_index = 0
+        cam_pos_index = 1
         # Get a random blueprint.
         blueprint_list = get_actor_blueprints(self.world, self._actor_filter, self._actor_generation)
         if not blueprint_list:
@@ -257,22 +281,43 @@ class World(object):
             self.player_max_speed = float(blueprint.get_attribute('speed').recommended_values[1])
             self.player_max_speed_fast = float(blueprint.get_attribute('speed').recommended_values[2])
 
-        # Spawn the player.
+        # Spawn the player. Town04 always resets to the same highway location;
+        # other maps retain the original manual_control.py spawn behaviour.
+        spawn_points = self.map.get_spawn_points()
+        if not spawn_points:
+            print('There are no spawn points available in your map/town.')
+            print('Please add some Vehicle Spawn Point to your UE4 scene.')
+            sys.exit(1)
+
+        fixed_highway_spawn = (
+            self._town04_highway_spawn(spawn_points)
+            if self.uses_town04_highway_route()
+            else None)
+
         if self.player is not None:
-            spawn_point = self.player.get_transform()
-            spawn_point.location.z += 2.0
-            spawn_point.rotation.roll = 0.0
-            spawn_point.rotation.pitch = 0.0
+            if fixed_highway_spawn is not None:
+                spawn_point = fixed_highway_spawn
+            else:
+                spawn_point = self.player.get_transform()
+                spawn_point.location.z += 2.0
+                spawn_point.rotation.roll = 0.0
+                spawn_point.rotation.pitch = 0.0
             self.destroy()
             self.player = self.world.try_spawn_actor(blueprint, spawn_point)
             self.show_vehicle_telemetry = False
             self.modify_vehicle_physics(self.player)
+
+        if self.player is None and fixed_highway_spawn is not None:
+            self.player = self.world.try_spawn_actor(
+                blueprint, fixed_highway_spawn)
+            if self.player is None:
+                raise RuntimeError(
+                    'The fixed Town04 highway spawn is occupied. Remove the '
+                    'vehicle at the western highway spawn and try again.')
+            self.show_vehicle_telemetry = False
+            self.modify_vehicle_physics(self.player)
+
         while self.player is None:
-            if not self.map.get_spawn_points():
-                print('There are no spawn points available in your map/town.')
-                print('Please add some Vehicle Spawn Point to your UE4 scene.')
-                sys.exit(1)
-            spawn_points = self.map.get_spawn_points()
             spawn_point = random.choice(spawn_points) if spawn_points else carla.Transform()
             self.player = self.world.try_spawn_actor(blueprint, spawn_point)
             self.show_vehicle_telemetry = False
@@ -384,16 +429,32 @@ class World(object):
 
 class KeyboardControl(object):
     """Class that handles keyboard input."""
-    def __init__(self, world, start_in_autopilot):
+    def __init__(
+            self,
+            world,
+            start_in_autopilot,
+            traffic_manager,
+            recovery_offset,
+            recovery_approach_seconds,
+            recovery_record_seconds):
         self._autopilot_enabled = start_in_autopilot
         self._ackermann_enabled = False
         self._ackermann_reverse = 1
         self._fullscreen = False
+        self._traffic_manager = traffic_manager
+        self._recovery_offset = recovery_offset
+        self._recovery_approach_seconds = recovery_approach_seconds
+        self._recovery_record_seconds = recovery_record_seconds
+        self._recovery_phase = None
+        self._recovery_deadline = None
+        self._recovery_actor_id = None
         if isinstance(world.player, carla.Vehicle):
             self._control = carla.VehicleControl()
             self._ackermann_control = carla.VehicleAckermannControl()
             self._lights = carla.VehicleLightState.NONE
             world.player.set_autopilot(self._autopilot_enabled)
+            if self._autopilot_enabled:
+                self._configure_town04_highway_autopilot(world)
             world.player.set_light_state(self._lights)
         elif isinstance(world.player, carla.Walker):
             self._control = carla.WalkerControl()
@@ -419,6 +480,7 @@ class KeyboardControl(object):
                         world.player.set_autopilot(False)
                         world.restart()
                         world.player.set_autopilot(True)
+                        self._configure_town04_highway_autopilot(world)
                     else:
                         world.restart()
                 elif event.key == K_F1:
@@ -563,6 +625,8 @@ class KeyboardControl(object):
                                   "experience some issues with the traffic simulation")
                         self._autopilot_enabled = not self._autopilot_enabled
                         world.player.set_autopilot(self._autopilot_enabled)
+                        if self._autopilot_enabled:
+                            self._configure_town04_highway_autopilot(world)
                         world.hud.notification(
                             'Autopilot %s' % ('On' if self._autopilot_enabled else 'Off'))
                     elif event.key == K_l and pygame.key.get_mods() & KMOD_CTRL:
@@ -598,10 +662,14 @@ class KeyboardControl(object):
                         else:
                             world.hud.notification(
                                 'No steering-model checkpoint loaded')
+                    elif event.key == K_k:
+                        self._toggle_recovery_collection(world)
                     elif event.key == K_z:
                         current_lights ^= carla.VehicleLightState.LeftBlinker
                     elif event.key == K_x:
                         current_lights ^= carla.VehicleLightState.RightBlinker
+
+        self._update_recovery_collection(world)
 
         if not self._autopilot_enabled:
             if isinstance(self._control, carla.VehicleControl):
@@ -632,6 +700,132 @@ class KeyboardControl(object):
             elif isinstance(self._control, carla.WalkerControl):
                 self._parse_walker_keys(pygame.key.get_pressed(), clock.get_time(), world)
                 world.player.apply_control(self._control)
+
+    def _configure_town04_highway_autopilot(self, world):
+        """Lock Town04 autopilot to the repeatable highway figure-eight."""
+        if (not world.uses_town04_highway_route() or
+                not isinstance(world.player, carla.Vehicle)):
+            return
+
+        self._traffic_manager.auto_lane_change(world.player, False)
+        self._traffic_manager.set_route(
+            world.player,
+            ['Straight'] * TOWN04_HIGHWAY_ROUTE_LENGTH)
+
+    def _toggle_recovery_collection(self, world):
+        """Start one offset-and-recover sequence, or cancel the active one."""
+        if self._recovery_phase is not None:
+            self._finish_recovery_collection(
+                world, 'Recovery collection cancelled')
+            return
+
+        if not isinstance(world.player, carla.Vehicle):
+            world.hud.notification(
+                'Recovery collection requires a vehicle')
+            return
+
+        if self.model_steering_enabled:
+            self.model_steering_enabled = False
+            world.hud.notification(
+                'Model steering disabled for autopilot recovery data')
+
+        if world.camera_manager.recording:
+            world.camera_manager.stop_recording()
+
+        # Recovery samples must use the same rigid forward RGB camera as
+        # NavisSteer inference, regardless of the player's current display view.
+        if (world.camera_manager.index != 0 or
+                world.camera_manager.transform_index != 1):
+            world.camera_manager.transform_index = 1
+            world.camera_manager.set_sensor(
+                0, notify=True, force_respawn=True)
+
+        if not self._autopilot_enabled:
+            self._autopilot_enabled = True
+            world.player.set_autopilot(True)
+
+        try:
+            self._configure_town04_highway_autopilot(world)
+            self._traffic_manager.auto_lane_change(
+                world.player, False)
+            self._traffic_manager.vehicle_lane_offset(
+                world.player, self._recovery_offset)
+        except Exception as error:
+            world.hud.notification(
+                'Could not start recovery collection: %s' % error)
+            return
+
+        self._recovery_phase = 'approach'
+        self._recovery_deadline = (
+            time.monotonic() + self._recovery_approach_seconds)
+        self._recovery_actor_id = world.player.id
+        direction = 'right' if self._recovery_offset > 0.0 else 'left'
+        world.hud.notification(
+            'Recovery setup: moving %.2f m %s; recording is OFF' %
+            (abs(self._recovery_offset), direction),
+            seconds=self._recovery_approach_seconds)
+
+    def _update_recovery_collection(self, world):
+        """Advance the automatic approach and recovery recording phases."""
+        if self._recovery_phase is None:
+            return
+
+        if (not isinstance(world.player, carla.Vehicle) or
+                world.player.id != self._recovery_actor_id):
+            self._finish_recovery_collection(
+                world, 'Recovery collection stopped after vehicle change')
+            return
+
+        if time.monotonic() < self._recovery_deadline:
+            return
+
+        if self._recovery_phase == 'approach':
+            try:
+                self._traffic_manager.vehicle_lane_offset(world.player, 0.0)
+                recording_started = world.camera_manager.start_recording(
+                    output_dir='recovery_data')
+                if not recording_started:
+                    self._finish_recovery_collection(
+                        world, 'Recovery recording could not be started')
+                    return
+            except Exception as error:
+                self._finish_recovery_collection(
+                    world, 'Could not begin recovery: %s' % error)
+                return
+            self._recovery_phase = 'record'
+            self._recovery_deadline = (
+                time.monotonic() + self._recovery_record_seconds)
+            world.hud.notification(
+                'Recovering to lane centre; recording is ON',
+                seconds=self._recovery_record_seconds)
+            return
+
+        self._finish_recovery_collection(
+            world, 'Recovery sequence saved; recording is OFF')
+
+    def _finish_recovery_collection(self, world, message):
+        """Restore the lane centre while keeping lane changes disabled."""
+        if isinstance(world.player, carla.Vehicle):
+            try:
+                self._traffic_manager.vehicle_lane_offset(
+                    world.player, 0.0)
+                self._traffic_manager.auto_lane_change(
+                    world.player, False)
+            except RuntimeError:
+                pass
+        if (self._recovery_phase == 'record' and
+                world.camera_manager.recording):
+            world.camera_manager.stop_recording()
+        self._recovery_phase = None
+        self._recovery_deadline = None
+        self._recovery_actor_id = None
+        world.hud.notification(message)
+
+    def stop_recovery_collection(self, world):
+        """Return Traffic Manager to its normal state during shutdown."""
+        if self._recovery_phase is not None:
+            self._finish_recovery_collection(
+                world, 'Recovery collection stopped')
 
     def _parse_vehicle_keys(self, keys, milliseconds):
         if keys[K_UP] or keys[K_w]:
@@ -1119,6 +1313,7 @@ class RadarSensor(object):
 
 class CameraManager(object):
     RECORDING_INTERVAL = 0.05
+    RECORDING_SOURCE_SIZE = (220, 220)
     RECORDING_SIZE = (220, 110)
 
     def __init__(self, parent_actor, hud, gamma_correction):
@@ -1132,6 +1327,7 @@ class CameraManager(object):
         self._recording_queue = None
         self._recording_error = None
         self._steer_values_file = None
+        self._recording_output_dir = 'new_data'
         self._next_image_number = None
         self._last_recorded_timestamp = None
         bound_x = 0.5 + self._parent.bounding_box.extent.x
@@ -1232,9 +1428,8 @@ class CameraManager(object):
         else:
             self.start_recording()
 
-    def start_recording(self):
+    def start_recording(self, output_dir='new_data'):
         with self._recording_lock:
-            output_dir = 'new_data'
             steer_values_path = os.path.join(output_dir, 'steer_values.txt')
             os.makedirs(output_dir, exist_ok=True)
 
@@ -1251,7 +1446,7 @@ class CameraManager(object):
             if len(image_paths) != existing_value_count:
                 self.hud.notification(
                     'Recording error: image/steering counts do not match')
-                return
+                return False
 
             image_numbers = []
             for image_path in image_paths:
@@ -1259,17 +1454,19 @@ class CameraManager(object):
                 if not stem.isdigit():
                     self.hud.notification(
                         'Recording error: output PNG names must be numeric')
-                    return
+                    return False
                 image_numbers.append(int(stem))
 
             self._steer_values_file = open(
                 steer_values_path, 'a', encoding='utf-8', buffering=1)
+            self._recording_output_dir = output_dir
             self._next_image_number = max(image_numbers, default=-1) + 1
             self._last_recorded_timestamp = None
             self._recording_error = None
             self._recording_queue = queue.Queue()
             self.recording = True
-            self.hud.notification('Dataset recording On')
+            self.hud.notification('Dataset recording On (20 FPS)')
+            return True
 
     def stop_recording(self, notify=True):
         with self._recording_lock:
@@ -1314,15 +1511,24 @@ class CameraManager(object):
                 return
 
             image_path = os.path.join(
-                'new_data', '%06d.png' % self._next_image_number)
+                self._recording_output_dir,
+                '%06d.png' % self._next_image_number)
             try:
-                cropped_array = self._crop_recording_frame(rgb_array)
                 recording_surface = pygame.surfarray.make_surface(
-                    cropped_array.swapaxes(0, 1))
-                # The crop already has a 2:1 aspect ratio, so this scales both
-                # axes uniformly instead of stretching the image.
+                    rgb_array.swapaxes(0, 1))
+                # Match NavisSteer inference and the original ROI dataset:
+                # resize the complete camera frame to 220x220 first, then keep
+                # only its bottom half (rows 110:220).
                 recording_surface = pygame.transform.smoothscale(
-                    recording_surface, self.RECORDING_SIZE)
+                    recording_surface, self.RECORDING_SOURCE_SIZE)
+                recording_surface = recording_surface.subsurface(
+                    pygame.Rect(
+                        0,
+                        self.RECORDING_SOURCE_SIZE[1] // 2,
+                        self.RECORDING_SIZE[0],
+                        self.RECORDING_SIZE[1],
+                    )
+                ).copy()
                 pygame.image.save(recording_surface, image_path)
                 self._steer_values_file.write('%.18e\n' % steer_value)
                 self._steer_values_file.flush()
@@ -1338,24 +1544,6 @@ class CameraManager(object):
                 return
 
             self._next_image_number += 1
-
-    @staticmethod
-    def _crop_recording_frame(rgb_array):
-        """Remove the upper half and return a centered, undistorted 2:1 crop."""
-        source_height, source_width = rgb_array.shape[:2]
-        lower_half = rgb_array[source_height // 2:, :, :]
-        crop_height, crop_width = lower_half.shape[:2]
-        target_aspect = 2.0
-
-        if crop_width / crop_height > target_aspect:
-            wanted_width = int(round(crop_height * target_aspect))
-            left = (crop_width - wanted_width) // 2
-            lower_half = lower_half[:, left:left + wanted_width, :]
-        elif crop_width / crop_height < target_aspect:
-            wanted_height = int(round(crop_width / target_aspect))
-            lower_half = lower_half[crop_height - wanted_height:, :, :]
-
-        return np.ascontiguousarray(lower_half)
 
     def report_recording_error(self):
         with self._recording_lock:
@@ -1469,6 +1657,62 @@ class NavisSteerCamera(object):
             self.sensor = None
 
 
+NAVISVISION_COLORS = (
+    (70, 210, 255),
+    (255, 170, 60),
+    (255, 100, 200),
+    (80, 230, 100),
+    (255, 180, 40),
+    (255, 70, 70),
+    (100, 180, 255),
+    (180, 120, 255),
+    (255, 110, 140),
+    (90, 255, 210),
+)
+
+
+def draw_navisvision_detections(display, detections, font):
+    """Draw normalized NavisVision boxes over the CARLA display."""
+
+    display_width, display_height = display.get_size()
+    for detection in detections:
+        left, top, right, bottom = detection["box"]
+        x = max(0, min(display_width - 1, int(left * display_width)))
+        y = max(0, min(display_height - 1, int(top * display_height)))
+        right_x = max(0, min(display_width - 1, int(right * display_width)))
+        bottom_y = max(
+            0,
+            min(display_height - 1, int(bottom * display_height)),
+        )
+        width = max(1, right_x - x)
+        height = max(1, bottom_y - y)
+        color = NAVISVISION_COLORS[
+            detection["class_id"] % len(NAVISVISION_COLORS)
+        ]
+        pygame.draw.rect(
+            display,
+            color,
+            pygame.Rect(x, y, width, height),
+            width=2,
+        )
+
+        caption = "%s %.0f%%" % (
+            detection["label"],
+            detection["score"] * 100.0,
+        )
+        label_surface = font.render(caption, True, (255, 255, 255))
+        label_x = x
+        label_y = max(0, y - label_surface.get_height() - 4)
+        background = pygame.Rect(
+            label_x,
+            label_y,
+            label_surface.get_width() + 6,
+            label_surface.get_height() + 4,
+        )
+        pygame.draw.rect(display, color, background)
+        display.blit(label_surface, (label_x + 3, label_y + 2))
+
+
 # ==============================================================================
 # -- game_loop() ---------------------------------------------------------------
 # ==============================================================================
@@ -1571,6 +1815,13 @@ def game_loop(args):
     server_process = None
     steering_runtime = None
     steering_camera = None
+    vision_runtime = None
+    vision_camera = None
+    vision_detections = []
+    vision_last_rgb_array = None
+    vision_font = None
+    traffic_manager = None
+    controller = None
     smoothed_steering = 0.0
 
     try:
@@ -1595,20 +1846,31 @@ def game_loop(args):
                 getattr(carla.WeatherParameters, args.weather))
             print('Weather preset: %s' % args.weather)
 
+        traffic_manager = client.get_trafficmanager()
+        traffic_manager.set_random_device_seed(
+            TOWN04_TRAFFIC_MANAGER_SEED)
+
         if args.sync:
             original_settings = sim_world.get_settings()
             settings = sim_world.get_settings()
-            if not settings.synchronous_mode:
-                settings.synchronous_mode = True
-                settings.fixed_delta_seconds = 0.05
+            settings.synchronous_mode = True
+            settings.fixed_delta_seconds = SYNC_FIXED_DELTA_SECONDS
             sim_world.apply_settings(settings)
 
-            traffic_manager = client.get_trafficmanager()
             traffic_manager.set_synchronous_mode(True)
-
-        if args.autopilot and not sim_world.get_settings().synchronous_mode:
-            print("WARNING: You are currently in asynchronous mode and could "
-                  "experience some issues with the traffic simulation")
+        else:
+            # Restore CARLA's native, free-running timing if a previous client
+            # crashed or exited while leaving synchronous settings behind.
+            settings = sim_world.get_settings()
+            if (settings.synchronous_mode or
+                    settings.fixed_delta_seconds is not None):
+                settings.synchronous_mode = False
+                settings.fixed_delta_seconds = None
+                sim_world.apply_settings(settings)
+            traffic_manager.set_synchronous_mode(False)
+            print(
+                'Native asynchronous simulation; display FPS is uncapped. '
+                'Dataset recording remains 20 FPS.')
 
         display = pygame.display.set_mode(
             (args.width, args.height),
@@ -1618,7 +1880,14 @@ def game_loop(args):
 
         hud = HUD(args.width, args.height)
         world = World(sim_world, hud, args)
-        controller = KeyboardControl(world, args.autopilot)
+        controller = KeyboardControl(
+            world,
+            args.autopilot,
+            traffic_manager,
+            args.recovery_offset,
+            args.recovery_approach_seconds,
+            args.recovery_record_seconds,
+        )
 
         steering_checkpoint = (
             args.navissteer_model or args.linearsteer_model
@@ -1662,19 +1931,83 @@ def game_loop(args):
             else:
                 print('Automatic throttle: %.2f' % args.model_throttle)
 
+        if args.navisvision_model:
+            try:
+                from navisvision_model import NavisVisionRuntime
+                vision_runtime = NavisVisionRuntime(
+                    args.navisvision_model,
+                    confidence_threshold=args.navisvision_confidence,
+                    nms_threshold=args.navisvision_nms,
+                    temporal_filter=not args.navisvision_no_temporal,
+                    temporal_window=args.navisvision_temporal_window,
+                    temporal_minimum_hits=args.navisvision_temporal_hits,
+                    temporal_match_iou=args.navisvision_track_iou,
+                    temporal_max_missed=args.navisvision_track_max_missed,
+                )
+            except Exception as error:
+                raise RuntimeError(
+                    'Could not load the NavisVision checkpoint: %s' % error
+                ) from error
+
+            if steering_camera is None:
+                vision_camera = NavisSteerCamera(
+                    world.player,
+                    args.width,
+                    args.height,
+                    args.gamma,
+                )
+            vision_font = pygame.font.Font(
+                pygame.font.get_default_font(),
+                16,
+            )
+            hud.notification(
+                'NavisVision loaded (%s); drawing detected objects' %
+                vision_runtime.device,
+                seconds=6.0,
+            )
+            print(
+                'NavisVision loaded on %s. Candidate confidence: %.2f; '
+                'temporal filtering: %s' %
+                (
+                    vision_runtime.device,
+                    args.navisvision_confidence,
+                    'off' if args.navisvision_no_temporal else
+                    '%d/%d frames' % (
+                        args.navisvision_temporal_hits,
+                        args.navisvision_temporal_window,
+                    ),
+                )
+            )
+
         if args.sync:
             sim_world.tick()
         else:
             sim_world.wait_for_tick()
 
         clock = pygame.time.Clock()
+        next_sync_tick = time.perf_counter() + SYNC_FIXED_DELTA_SECONDS
         while True:
+            simulation_advanced = not args.sync
             if args.sync:
-                sim_world.tick()
-            clock.tick_busy_loop(60)
+                now = time.perf_counter()
+                if now >= next_sync_tick:
+                    sim_world.tick()
+                    simulation_advanced = True
+                    next_sync_tick += SYNC_FIXED_DELTA_SECONDS
+                    if next_sync_tick <= time.perf_counter():
+                        # A slow frame must not cause a burst of catch-up ticks.
+                        next_sync_tick = (
+                            time.perf_counter()
+                            + SYNC_FIXED_DELTA_SECONDS)
+
+            # No software display cap. In synchronous mode the most recent
+            # camera frame can be redrawn between 20 Hz simulation updates
+            # without issuing extra CARLA physics ticks.
+            clock.tick()
             if controller.parse_events(client, world, clock, args.sync):
                 return
-            if (steering_runtime is not None and
+            if (simulation_advanced and
+                    steering_runtime is not None and
                     controller.model_steering_enabled and
                     isinstance(world.player, carla.Vehicle)):
                 if (steering_camera is None or
@@ -1688,6 +2021,10 @@ def game_loop(args):
                         args.gamma,
                     )
                     smoothed_steering = 0.0
+                    if vision_runtime is not None:
+                        vision_runtime.reset_temporal_filter()
+                        vision_last_rgb_array = None
+                        vision_detections = []
                 rgb_array = steering_camera.latest_rgb_array
                 if rgb_array is not None:
                     predicted_steering = steering_runtime.predict(rgb_array)
@@ -1705,12 +2042,52 @@ def game_loop(args):
                         else:
                             model_control.throttle = args.model_throttle
                     world.player.apply_control(model_control)
+
+            if (simulation_advanced and
+                    vision_runtime is not None and
+                    isinstance(world.player, carla.Vehicle)):
+                inference_camera = None
+                if (steering_camera is not None and
+                        steering_camera.parent_id == world.player.id):
+                    inference_camera = steering_camera
+                else:
+                    if (vision_camera is None or
+                            vision_camera.parent_id != world.player.id):
+                        if vision_camera is not None:
+                            vision_camera.destroy()
+                        vision_camera = NavisSteerCamera(
+                            world.player,
+                            args.width,
+                            args.height,
+                            args.gamma,
+                        )
+                        vision_last_rgb_array = None
+                        vision_detections = []
+                        vision_runtime.reset_temporal_filter()
+                    inference_camera = vision_camera
+
+                rgb_array = inference_camera.latest_rgb_array
+                if (rgb_array is not None and
+                        rgb_array is not vision_last_rgb_array):
+                    vision_detections = vision_runtime.predict(rgb_array)
+                    vision_last_rgb_array = rgb_array
+
             display = pygame.display.get_surface()
-            world.tick(clock)
+            if simulation_advanced:
+                world.tick(clock)
             world.render(display)
+            if vision_runtime is not None:
+                draw_navisvision_detections(
+                    display,
+                    vision_detections,
+                    vision_font,
+                )
             pygame.display.flip()
 
     finally:
+
+        if controller is not None and world is not None:
+            controller.stop_recovery_collection(world)
 
         if original_settings:
             sim_world.apply_settings(original_settings)
@@ -1720,6 +2097,10 @@ def game_loop(args):
 
         if steering_camera is not None:
             steering_camera.destroy()
+
+        if (vision_camera is not None and
+                vision_camera is not steering_camera):
+            vision_camera.destroy()
 
         if world is not None:
             world.destroy()
@@ -1767,8 +2148,8 @@ def main():
     argparser.add_argument(
         '--filter',
         metavar='PATTERN',
-        default='vehicle.*',
-        help='actor filter (default: "vehicle.*")')
+        default='vehicle.tesla.model3',
+        help='actor filter (locked to "vehicle.tesla.model3")')
     argparser.add_argument(
         '--generation',
         metavar='G',
@@ -1783,7 +2164,7 @@ def main():
         '--weather',
         metavar='PRESET',
         default=None,
-        help='CARLA weather preset such as ClearNoon')
+        help='CARLA weather preset (default: ClearSunset)')
     argparser.add_argument(
         '--rolename',
         metavar='NAME',
@@ -1797,7 +2178,9 @@ def main():
     argparser.add_argument(
         '--sync',
         action='store_true',
-        help='Activate synchronous mode execution')
+        help=(
+            'optional deterministic 20 Hz simulation; omit for native '
+            'uncapped operation'))
     argparser.add_argument(
         '--show-server-window',
         action='store_true',
@@ -1814,6 +2197,51 @@ def main():
         default=None,
         help='use a LinearSteer baseline checkpoint to control steering')
     argparser.add_argument(
+        '--navisvision-model',
+        metavar='CHECKPOINT',
+        default=None,
+        help='draw detections from a NavisVision checkpoint')
+    argparser.add_argument(
+        '--navisvision-confidence',
+        metavar='VALUE',
+        default=0.20,
+        type=float,
+        help='minimum raw NavisVision candidate confidence (default: 0.20)')
+    argparser.add_argument(
+        '--navisvision-nms',
+        metavar='VALUE',
+        default=0.40,
+        type=float,
+        help='NavisVision non-maximum-suppression IoU (default: 0.40)')
+    argparser.add_argument(
+        '--navisvision-no-temporal',
+        action='store_true',
+        help='disable NavisVision frame-to-frame confirmation and smoothing')
+    argparser.add_argument(
+        '--navisvision-temporal-window',
+        metavar='FRAMES',
+        default=5,
+        type=int,
+        help='NavisVision temporal history length (default: 5)')
+    argparser.add_argument(
+        '--navisvision-temporal-hits',
+        metavar='FRAMES',
+        default=3,
+        type=int,
+        help='detections required within temporal history (default: 3)')
+    argparser.add_argument(
+        '--navisvision-track-iou',
+        metavar='VALUE',
+        default=0.30,
+        type=float,
+        help='minimum IoU for matching detections across frames (default: 0.30)')
+    argparser.add_argument(
+        '--navisvision-track-max-missed',
+        metavar='FRAMES',
+        default=2,
+        type=int,
+        help='frames a confirmed detection may temporarily disappear (default: 2)')
+    argparser.add_argument(
         '--model-throttle',
         metavar='VALUE',
         default=None,
@@ -1825,17 +2253,38 @@ def main():
         default=0.35,
         type=float,
         help='new-prediction weight from 0 to 1 (default: 0.35)')
+    argparser.add_argument(
+        '--recovery-offset',
+        metavar='METRES',
+        default=0.5,
+        type=float,
+        help=(
+            'lateral Traffic Manager offset used by K recovery collection; '
+            'positive is right and negative is left (default: 0.5)'))
+    argparser.add_argument(
+        '--recovery-approach-seconds',
+        metavar='SECONDS',
+        default=3.0,
+        type=float,
+        help='time spent reaching the recovery offset (default: 3.0)')
+    argparser.add_argument(
+        '--recovery-record-seconds',
+        metavar='SECONDS',
+        default=4.0,
+        type=float,
+        help='time recorded while returning to lane centre (default: 4.0)')
     args = argparser.parse_args()
 
-    # Use the cleanest known dataset-like setup unless explicitly overridden.
-    if args.navissteer_model or args.linearsteer_model:
-        if args.map is None:
-            args.map = 'Town04'
-        if args.weather is None:
-            args.weather = 'ClearNoon'
-        if args.filter == 'vehicle.*':
-            args.filter = 'vehicle.tesla.model3'
+    # NavisAI always uses the same ego vehicle, regardless of launch options.
+    args.filter = 'vehicle.tesla.model3'
 
+    # Town04 is NavisAI's default collection and evaluation environment.
+    if args.map is None:
+        args.map = 'Town04'
+
+    # Use clear sunset lighting unless explicitly overridden.
+    if args.weather is None:
+        args.weather = 'ClearSunset'
     if args.model_throttle is not None and not 0.0 <= args.model_throttle <= 1.0:
         argparser.error('--model-throttle must be between 0.0 and 1.0')
     if (args.model_throttle is not None and
@@ -1845,6 +2294,28 @@ def main():
             '--linearsteer-model')
     if not 0.0 < args.steering_smoothing <= 1.0:
         argparser.error('--steering-smoothing must be greater than 0 and at most 1')
+    if not 0.0 <= args.navisvision_confidence <= 1.0:
+        argparser.error(
+            '--navisvision-confidence must be between 0.0 and 1.0')
+    if not 0.0 <= args.navisvision_nms <= 1.0:
+        argparser.error('--navisvision-nms must be between 0.0 and 1.0')
+    if args.navisvision_temporal_window < 1:
+        argparser.error('--navisvision-temporal-window must be at least 1')
+    if not 1 <= args.navisvision_temporal_hits <= args.navisvision_temporal_window:
+        argparser.error(
+            '--navisvision-temporal-hits must be between 1 and '
+            '--navisvision-temporal-window')
+    if not 0.0 <= args.navisvision_track_iou <= 1.0:
+        argparser.error('--navisvision-track-iou must be between 0.0 and 1.0')
+    if args.navisvision_track_max_missed < 0:
+        argparser.error('--navisvision-track-max-missed cannot be negative')
+    if not 0.05 <= abs(args.recovery_offset) <= 1.5:
+        argparser.error(
+            '--recovery-offset magnitude must be between 0.05 and 1.5 metres')
+    if args.recovery_approach_seconds <= 0.0:
+        argparser.error('--recovery-approach-seconds must be greater than 0')
+    if args.recovery_record_seconds <= 0.0:
+        argparser.error('--recovery-record-seconds must be greater than 0')
 
     args.width, args.height = [int(x) for x in args.res.split('x')]
 
