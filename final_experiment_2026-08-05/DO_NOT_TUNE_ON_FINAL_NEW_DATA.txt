@@ -1,0 +1,1 @@
+This snapshot defines the final experiment. Data collected after this freeze is evaluation-only and must not be used for training, validation, confidence-threshold selection, NMS selection, or preprocessing changes.

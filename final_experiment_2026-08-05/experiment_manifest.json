@@ -1,0 +1,188 @@
+{
+  "experiment_status": "complete",
+  "frozen_at_utc": "2026-08-05T21:42:23.985996+00:00",
+  "project_root_at_freeze": "C:\\Users\\jonal\\OneDrive\\Desktop\\Projects\\NavisAI",
+  "environment": {
+    "python": "3.12.10 (tags/v3.12.10:0cc8128, Apr  8 2025, 12:21:36) [MSC v.1943 64 bit (AMD64)]",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "torch": "2.11.0+cu128",
+    "cuda_available": true,
+    "cuda_device": "NVIDIA GeForce RTX 2060"
+  },
+  "git": {
+    "commit": "dcda24d32b2255ee544be8a6b8217df48684bc43",
+    "working_tree_status_at_freeze": [
+      "M manual_control.py",
+      " M navisvision_model.py",
+      " M requirements.txt",
+      "?? freeze_final_experiment.py"
+    ]
+  },
+  "settings": {
+    "steering": {
+      "source_frame_size": [
+        220,
+        220
+      ],
+      "roi_crop_xyxy": [
+        0,
+        110,
+        220,
+        220
+      ],
+      "model_input_chw": [
+        3,
+        110,
+        220
+      ]
+    },
+    "object_detection": {
+      "model_input_hw": [
+        416,
+        416
+      ],
+      "classes": [
+        "traffic_light_green",
+        "traffic_light_orange",
+        "traffic_light_red",
+        "traffic_sign_30",
+        "traffic_sign_60",
+        "traffic_sign_90"
+      ],
+      "offline_counting_confidence": 0.5,
+      "carla_display_confidence": 0.4,
+      "nms_iou": 0.4,
+      "carla_detector_fps": 5.0,
+      "temporal_filter": {
+        "enabled": true,
+        "window": 5,
+        "minimum_hits": 3
+      }
+    },
+    "new_data_policy": {
+      "training_allowed": false,
+      "validation_allowed": false,
+      "threshold_tuning_allowed": false,
+      "purpose": "final evaluation only"
+    }
+  },
+  "missing_files": [],
+  "checkpoints": {
+    "navissteer": {
+      "source": "models\\navissteer_finetuned_bestV2.pt",
+      "frozen_copy": "models\\navissteer_finetuned_bestV2.pt",
+      "bytes": 4283341,
+      "sha256": "db0d9644bff49d1a9d863edbdced7f351df87c9c04d7a79b6b534c31301d8b1a",
+      "metadata": {
+        "model_name": "NavisSteer",
+        "epoch": 153,
+        "validation_loss": 0.004984834275000477,
+        "image_size": [
+          110,
+          220
+        ],
+        "input_mode": "roi",
+        "input_channels": 3,
+        "base_frame_stride": 4,
+        "new_data_frame_stride": 1,
+        "recovery_data_frame_stride": 1,
+        "batch_size": 256,
+        "learning_rate": 5e-05,
+        "split_seed": 1000
+      }
+    },
+    "linearsteer": {
+      "source": "models\\linearsteer_best.pt",
+      "frozen_copy": "models\\linearsteer_best.pt",
+      "bytes": 294405,
+      "sha256": "1b49ff3ed3227266f1d41295758569c3f78da816d9d3f22cffcf242ad19d04cc",
+      "metadata": {
+        "model_name": "LinearSteer",
+        "epoch": 80,
+        "validation_mse": 0.028420310002251096,
+        "image_size": [
+          110,
+          220
+        ],
+        "input_mode": "roi",
+        "input_channels": 3,
+        "frame_stride": 4,
+        "batch_size": 256,
+        "learning_rate": 0.001,
+        "split_seed": 1000
+      }
+    },
+    "custom_navisvision_v2": {
+      "source": "models\\navisvision_v2_traffic_controls_best.pt",
+      "frozen_copy": "models\\navisvision_v2_traffic_controls_best.pt",
+      "bytes": 40616975,
+      "sha256": "478fbc8565b08f5cc3a0d510c6ba1352adda3d899937e3c135cd26bd7ffde795",
+      "metadata": {
+        "model_name": "NavisVision",
+        "architecture_version": 2,
+        "epoch": 47,
+        "validation_loss": 0.42770894765853884,
+        "image_size": 416,
+        "batch_size": 16,
+        "learning_rate": 0.0005,
+        "classes": [
+          "traffic_light_green",
+          "traffic_light_orange",
+          "traffic_light_red",
+          "traffic_sign_30",
+          "traffic_sign_60",
+          "traffic_sign_90"
+        ]
+      }
+    },
+    "faster_rcnn": {
+      "source": "models\\navisvision_fasterrcnn_resnet50_fpn_best.pt",
+      "frozen_copy": "models\\navisvision_fasterrcnn_resnet50_fpn_best.pt",
+      "bytes": 173521009,
+      "sha256": "7bd14cacb9bdb4627fa9058399e57a0981e53fc221a0fcc89a7a6b1e3f7e63ef",
+      "metadata": {
+        "model_name": "Faster R-CNN ResNet-50-FPN",
+        "architecture": "fasterrcnn_resnet50_fpn_v2",
+        "task": "traffic_control_object_detection",
+        "pretrained": true,
+        "epoch": 8,
+        "validation_map_50": 0.9468681812286377,
+        "image_size": 416,
+        "classes": [
+          "traffic_light_green",
+          "traffic_light_orange",
+          "traffic_light_red",
+          "traffic_sign_30",
+          "traffic_sign_60",
+          "traffic_sign_90"
+        ]
+      }
+    }
+  },
+  "source_files": {
+    "manual_control.py": {
+      "source": "manual_control.py",
+      "frozen_copy": "source\\manual_control.py",
+      "bytes": 110270,
+      "sha256": "922712715aab080f45d868f293ff98845659cb97118060501571d2bda0c73bf6"
+    },
+    "navissteer_model.py": {
+      "source": "navissteer_model.py",
+      "frozen_copy": "source\\navissteer_model.py",
+      "bytes": 12876,
+      "sha256": "aa348b7095f5b619af7fba2f9b458fc9eeb708791a74e576d62520d0be63b500"
+    },
+    "navisvision_model.py": {
+      "source": "navisvision_model.py",
+      "frozen_copy": "source\\navisvision_model.py",
+      "bytes": 49159,
+      "sha256": "7615d984805f591c0a75bc66e908e448b72fa76ac60b8aa1fb27ca816ff5cee5"
+    },
+    "requirements.txt": {
+      "source": "requirements.txt",
+      "frozen_copy": "source\\requirements.txt",
+      "bytes": 192,
+      "sha256": "ce7309ff19cf63a4c9364cb2bfa1498202f625bd1ba6faa821bea00762a2c32b"
+    }
+  }
+}
